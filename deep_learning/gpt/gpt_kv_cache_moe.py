@@ -94,7 +94,6 @@ class MultiHeadAttention(nn.Module):
         # self.register_buffer('mask', torch.triu(torch.ones(context_length, context_length), diagonal=1))
         self.register_buffer('cache_k', None, persistent=False) # persistent - whether the buffer is part of the module’s state_dict
         self.register_buffer('cache_v', None, persistent=False)  # persistent - whether the buffer is part of the module’s state_dict
-        self.ptr_current_pos = 0
 
     def forward(self, x, use_cache=False):
         batch, num_tokens, dim = x.shape
@@ -154,14 +153,14 @@ class MultiHeadAttention(nn.Module):
         K = attn_scores.size(-1) # number of Keys
         if num_tokens == K:
             # No cache → use the pre‑baked triangular mask slice
-            casual_mask = torch.triu(torch.ones(num_tokens, K, device=x.device, dtype=torch.bool), diagonal=1)
+            causal_mask = torch.triu(torch.ones(num_tokens, K, device=x.device, dtype=torch.bool), diagonal=1)
         else:
             # cached
             offset = K - num_tokens # number of tokens already in cache before this chunk
             row_idx = torch.arange(num_tokens, device=x.device).unsqueeze(1) # (num_tokens, 1) -> query token positions. row 0 → first new token, row 1 → second new token
             col_idx = torch.arange(K, device=x.device).unsqueeze(0) # (1, K) # key positions, col 0 → first cached token, col 5 → newest token
             # unsqeezes -> for broadcasting (num_tokens, K)
-            casual_mask = row_idx + offset < col_idx # True where j > i+offset: mask future tokens; Query index i can see keys up to (offset + i)
+            causal_mask = row_idx + offset < col_idx # True where j > i+offset: mask future tokens; Query index i can see keys up to (offset + i)
             # offset to catch the correct index: cache have older indicies, query newer -> missmatch.
 
             # Example: num_tokens=2, K=8, offset=6
@@ -176,7 +175,7 @@ class MultiHeadAttention(nn.Module):
             #
             #   Q0 (pos 6) attends to keys ≤6, Q1 (pos 7) attends to keys ≤7
 
-        attn_scores.masked_fill_(casual_mask.unsqueeze(0).unsqueeze(0), -torch.inf)
+        attn_scores.masked_fill_(causal_mask.unsqueeze(0).unsqueeze(0), -torch.inf)
         
         attn_weights = torch.softmax(attn_scores / keys.shape[-1]**0.5, dim=-1)
         attn_weights = self.dropout(attn_weights)

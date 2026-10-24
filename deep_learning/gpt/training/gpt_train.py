@@ -1,11 +1,47 @@
 import torch
 import torch.nn as nn
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset, DataLoader, Subset
 import matplotlib.pyplot as plt
-import argparse
 from pathlib import Path
 import numpy as np
 import math
+from dataclasses import dataclass
+
+
+@dataclass
+class TrainConfig:
+    # Hardware
+    device: str = "cuda:1" if torch.cuda.is_available() else "cpu"
+
+    # Data
+    data_dir: str = '/home/dan_yef/gutenberg_preprocessed'
+    batch_size: int = 8
+
+    # Optimization
+    num_epochs: int = 2
+    learning_rate: float = 5e-4       
+    pct_start: float = 0.03          
+    weight_decay: float = 0.01
+    gradient_clipping: bool = True
+
+    # Evaluation
+    eval_freq: int = 1000
+    eval_iter: int = 20
+
+    # Checkpointing
+    output_dir: str = "/home/dan_yef/model_checkpoints"
+    save_ckpt_freq: int = 100_000
+
+
+@dataclass
+class ModelConfig:
+    vocab_size: int = 50257           # Vocabulary size
+    context_length: int = 1024        # Context length
+    emb_dim: int = 768                # Embedding dimension
+    n_heads: int = 12                 # Number of attention heads
+    n_layers: int = 12                # Number of layers
+    drop_rate: float = 0.1            # Dropout rate
+    qkv_bias: bool = False            # Query-key-value bias
 
 
 class GPTDataset(Dataset):
@@ -24,8 +60,12 @@ class GPTDataset(Dataset):
         return torch.from_numpy(inputs), torch.from_numpy(targets)
     
 
-def create_dataloader(path_bin_file, batch_size=4, max_length=256, stride=128, shuffle=True, drop_last=True, num_workers=0):
+def create_dataloader(path_bin_file, batch_size=4, max_length=256, stride=128, shuffle=True, drop_last=True, num_workers=0, num_samples=None):
     dataset = GPTDataset(path_bin_file, max_length, stride)
+    if num_samples is not None:
+        num_samples = min(num_samples, len(dataset))
+        indices = torch.linspace(0, len(dataset) - 1, num_samples).long().tolist()
+        dataset = Subset(dataset, indices)
     dataloader = DataLoader(
         dataset, batch_size=batch_size, shuffle=shuffle, drop_last=drop_last, num_workers=num_workers
     )
@@ -63,9 +103,9 @@ class FeedForward(nn.Module):
     def __init__(self, cfg):
         super().__init__()
         self.layers = nn.Sequential(
-            nn.Linear(cfg["emb_dim"], 4 * cfg["emb_dim"]),
+            nn.Linear(cfg.emb_dim, 4 * cfg.emb_dim),
             GELU(),
-            nn.Linear(4 * cfg["emb_dim"], cfg["emb_dim"])
+            nn.Linear(4 * cfg.emb_dim, cfg.emb_dim)
         )
 
     def forward(self, x):
@@ -195,17 +235,17 @@ class TransformerBlock(nn.Module):
     def __init__(self, cfg):
         super().__init__()
         self.att = MultiHeadAttention(
-            d_in=cfg["emb_dim"],
-            d_out=cfg["emb_dim"],
-            context_length=cfg["context_length"],
-            num_heads=cfg["n_heads"],
-            dropout=cfg["drop_rate"],
-            qkv_bias=cfg["qkv_bias"]
+            d_in=cfg.emb_dim,
+            d_out=cfg.emb_dim,
+            context_length=cfg.context_length,
+            num_heads=cfg.n_heads,
+            dropout=cfg.drop_rate,
+            qkv_bias=cfg.qkv_bias
         )
         self.ff = FeedForward(cfg)
-        self.norm1 = LayerNorm(cfg["emb_dim"])
-        self.norm2 = LayerNorm(cfg["emb_dim"])
-        self.drop_shortcut = nn.Dropout(cfg["drop_rate"])
+        self.norm1 = LayerNorm(cfg.emb_dim)
+        self.norm2 = LayerNorm(cfg.emb_dim)
+        self.drop_shortcut = nn.Dropout(cfg.drop_rate)
 
     def forward(self, x, use_cache=False):
         # Shortcut connection for attention block
@@ -228,17 +268,17 @@ class TransformerBlock(nn.Module):
 class GPTModel(nn.Module):
     def __init__(self, cfg):
         super().__init__()
-        self.tok_emb = nn.Embedding(cfg["vocab_size"], cfg["emb_dim"])
-        self.pos_emb = nn.Embedding(cfg["context_length"], cfg["emb_dim"])
-        self.drop_emb = nn.Dropout(cfg["drop_rate"])
+        self.tok_emb = nn.Embedding(cfg.vocab_size, cfg.emb_dim)
+        self.pos_emb = nn.Embedding(cfg.context_length, cfg.emb_dim)
+        self.drop_emb = nn.Dropout(cfg.drop_rate)
 
         self.trf_blocks = nn.ModuleList(
-            [TransformerBlock(cfg) for _ in range(cfg["n_layers"])])
+            [TransformerBlock(cfg) for _ in range(cfg.n_layers)])
         self.ptr_current_pos = 0
 
-        self.final_norm = LayerNorm(cfg["emb_dim"])
-        self.head_out = nn.Linear(cfg["emb_dim"], cfg["vocab_size"], bias=False)
-        self.kv_window_size = cfg["kv_window_size"]  if "kv_window_size" in cfg else cfg["context_length"]
+        self.final_norm = LayerNorm(cfg.emb_dim)
+        self.head_out = nn.Linear(cfg.emb_dim, cfg.vocab_size, bias=False)
+        self.kv_window_size = getattr(cfg, "kv_window_size", cfg.context_length)
 
     def forward(self, in_idx, use_cache=False):
         batch_size, seq_len = in_idx.shape
@@ -302,26 +342,37 @@ def evaluate_model(model, train_loader, val_loader, device):
     return train_loss, val_loss
 
 
-def train_model_simple(model, train_loader, val_loader, optimizer, device, num_epochs, eval_freq, eval_iter, output_dir, save_ckpt_freq):
+def train_model_simple(model, train_loader, val_loader, optimizer, scheduler, training_config):
     train_losses, val_losses, track_tokens_seen = [], [], []
     tokens_seen, global_step = 0, -1
+    Path(training_config.output_dir).mkdir(parents=True, exist_ok=True)
 
-    for epoch in range(num_epochs):
+    for epoch in range(training_config.num_epochs):
         model.train()
 
         for input_batch, target_batch in train_loader:
             optimizer.zero_grad()
-            loss = calc_loss_batch(input_batch, target_batch, model, device)
+
+            with torch.autocast(device_type=training_config.device, dtype=torch.bfloat16):
+                loss = calc_loss_batch(input_batch, target_batch, model, training_config.device)
             loss.backward()
+
+            if training_config.gradient_clipping:
+                nn.utils.clip_grad_norm_(
+                    model.parameters(),
+                    max_norm=1.0
+                )
+
             optimizer.step()
+            scheduler.step()
             tokens_seen += input_batch.numel()
             global_step +=1
 
-            if global_step % eval_freq == 0:
+            if global_step % training_config.eval_freq == 0:
                 with torch.no_grad():
                     model.eval()
-                    train_loss = calc_loss_loader(train_loader, model, device, num_batches = eval_iter)
-                    val_loss = calc_loss_loader(val_loader, model, device, num_batches = eval_iter) 
+                    train_loss = calc_loss_loader(train_loader, model, training_config.device, num_batches = training_config.eval_iter)
+                    val_loss = calc_loss_loader(val_loader, model, training_config.device, num_batches = training_config.eval_iter)
                     train_losses.append(train_loss)
                     val_losses.append(val_loss)
                     track_tokens_seen.append(tokens_seen)
@@ -330,15 +381,25 @@ def train_model_simple(model, train_loader, val_loader, optimizer, device, num_e
                       f"Train loss {train_loss:.3f}, Val loss {val_loss:.3f}")
                 model.train()
 
-        if global_step % save_ckpt_freq == 0:
-            torch.save({
-                "epoch": epoch,
-                "model": model.state_dict(),
-                "optimizer": optimizer.state_dict(),
-                "train_loss": train_loss,
-                "val_loss": val_loss
-            })
+            if global_step % training_config.save_ckpt_freq == 0 and global_step != 0:
+                torch.save({
+                    "epoch": epoch,
+                    "model": model.state_dict(),
+                    "optimizer": optimizer.state_dict(),
+                    "train_loss": train_loss,
+                    "val_loss": val_loss
+                }, Path(training_config.output_dir) / f"checkpoint_{global_step}.pt" 
+                )
 
+    torch.save({
+        "epoch": epoch,
+        "model": model.state_dict(),
+        "optimizer": optimizer.state_dict(),
+        "train_loss": train_loss,
+        "val_loss": val_loss
+    }, Path(training_config.output_dir) / f"last_checkpoint.pt" 
+    )
+    
     
     return train_losses, val_losses, track_tokens_seen
 
@@ -361,26 +422,22 @@ def plot_losses(epochs_seen, tokens_seen, train_losses, val_losses):
     fig.tight_layout()  # Adjust layout to make room
 
 
-def main(config, settings):
+def main(model_config, training_config):
     
     torch.manual_seed(123)
-    device = "cuda:1" if torch.cuda.is_available() else "cpu"
 
-    model = GPTModel(config)
-    model.to(device=device)
-    optimizer = torch.optim.AdamW(
-        model.parameters(), lr=settings["learning_rate"], weight_decay=settings["weight_decay"]
-    )
+    model = GPTModel(model_config)
+    model.to(device=training_config.device)
 
-    train_file_path = Path(args.data_dir) / "train.bin"
-    valid_file_path = Path(args.data_dir) / "val.bin"
+    train_file_path = Path(training_config.data_dir) / "train.bin"
+    valid_file_path = Path(training_config.data_dir) / "val.bin"
 
 
     train_loader = create_dataloader(
         train_file_path,
-        batch_size=settings["batch_size"],
-        max_length=config["context_length"],
-        stride=config["context_length"],
+        batch_size=training_config.batch_size,
+        max_length=model_config.context_length,
+        stride=model_config.context_length,
         drop_last=True,
         shuffle=True,
         num_workers=0
@@ -388,19 +445,28 @@ def main(config, settings):
 
     val_loader = create_dataloader(
         valid_file_path,
-        batch_size=settings["batch_size"],
-        max_length=config["context_length"],
-        stride=config["context_length"],
+        batch_size=training_config.batch_size,
+        max_length=model_config.context_length,
+        stride=model_config.context_length,
         drop_last=False,
         shuffle=False,
-        num_workers=0
+        num_workers=0,
+        num_samples=training_config.eval_iter * training_config.batch_size
+    )
+
+
+    optimizer = torch.optim.AdamW(
+        model.parameters(), lr=training_config.learning_rate, weight_decay=training_config.weight_decay
+    )
+    scheduler = torch.optim.lr_scheduler.OneCycleLR(
+        optimizer=optimizer, max_lr=training_config.learning_rate, pct_start= training_config.pct_start, 
+        steps_per_epoch=len(train_loader), epochs=training_config.num_epochs, cycle_momentum=False          
     )
 
     # Train model
     train_losses, val_losses, tokens_seen = train_model_simple(
-        model, train_loader, val_loader, optimizer, device,
-        num_epochs=settings["num_epochs"], eval_freq=settings["eval_freq"], eval_iter=1,
-        output_dir=settings["output_dir"], save_ckpt_freq=settings["save_ckpt_freq"],
+        model, train_loader, val_loader, optimizer, scheduler,
+        training_config=training_config,
     )
 
     return train_losses, val_losses, tokens_seen, model
@@ -408,52 +474,11 @@ def main(config, settings):
 
 if __name__ == "__main__":
 
-    parser = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter, description= "GPT Training")
-    parser.add_argument("--data_dir", type=str, default='/home/dan_yef/gutenberg_preprocessed')
-    parser.add_argument("--output_dir", type=str, default='model_checkpoints')
-    parser.add_argument("--n_epochs",type=int, default=5)
-    parser.add_argument("--eval_freq", type=int, default=500)
-    parser.add_argument("--save_ckpt_freq", type=int, default=100_000)
-    parser.add_argument("--lr",type=float, default=5e-4)
-    parser.add_argument("--batch_size", type=int, default=16)
-    parser.add_argument("--weight_decay", type=float, default=0.1)
-    parser.add_argument("--debug", type=bool, default=False)
+    MODEL_CONFIG = ModelConfig()
+    TRAINING_CONFIG = TrainConfig()
 
-    args = parser.parse_args()
-    if args.debug:
-        GPT_CONFIG_124M = {
-            "vocab_size": 50257,    # Vocabulary size
-            "context_length": 256,  # Shortened context length (orig: 1024)
-            "emb_dim": 768,         # Embedding dimension
-            "n_heads": 12,          # Number of attention heads
-            "n_layers": 12,         # Number of layers
-            "drop_rate": 0.1,       # Dropout rate
-            "qkv_bias": False       # Query-key-value bias
-        }
-    else:
-        GPT_CONFIG_124M = {
-            "vocab_size": 50257,    # Vocabulary size
-            "context_length": 1024,  # Shortened context length (orig: 1024)
-            "emb_dim": 768,         # Embedding dimension
-            "n_heads": 12,          # Number of attention heads
-            "n_layers": 12,         # Number of layers
-            "drop_rate": 0.1,       # Dropout rate
-            "qkv_bias": False       # Query-key-value bias
-        }
-
-    OTHER_SETTINGS = {
-        "learning_rate": args.lr,
-        "num_epochs": args.n_epochs,
-        "batch_size": args.batch_size,
-        "weight_decay": args.weight_decay,
-        "eval_freq": args.eval_freq,
-        "output_dir": args.output_dir,
-        "save_ckpt_freq": args.save_ckpt_freq
-    }
-
-
-    train_losses, val_losses, tokens_seen, model = main(GPT_CONFIG_124M, OTHER_SETTINGS)
-    epochs_tensor = torch.linspace(0, OTHER_SETTINGS["num_epochs"], len(train_losses))
+    train_losses, val_losses, tokens_seen, model = main(MODEL_CONFIG, TRAINING_CONFIG)
+    epochs_tensor = torch.linspace(0, TRAINING_CONFIG.num_epochs, len(train_losses))
     plot_losses(epochs_tensor, tokens_seen, train_losses, val_losses)
     plt.savefig("loss.pdf")
 

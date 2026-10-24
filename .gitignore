@@ -1,2 +1,25 @@
 .DS_Store
 venv/
+.venv/
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Editors
+.vscode/
+.idea/
+
+# Training outputs (checkpoints, token files, plots, logs)
+model_checkpoints/
+*.pt
+*.pth
+*.ckpt
+*.bin
+loss.pdf
+runs/
+wandb/

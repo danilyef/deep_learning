@@ -11,7 +11,7 @@ from dataclasses import dataclass
 @dataclass
 class TrainConfig:
     # Hardware
-    device: str = "cuda:1" if torch.cuda.is_available() else "cpu"
+    device: str = "cuda" if torch.cuda.is_available() else "cpu"
 
     # Data
     data_dir: str = '/home/dan_yef/gutenberg_preprocessed'
